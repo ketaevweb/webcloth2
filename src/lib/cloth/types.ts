@@ -13,6 +13,14 @@ export type BackendKind = "webgpu" | "cpu";
  */
 export const AERO_SCALE = 600;
 
+/**
+ * Per-particle streaming (linear) drag: f = (windVel - v) * aeroDrag * STREAM_DRAG.
+ * Pure normal-pressure aerodynamics goes blind when a surface faces the wind
+ * edge-on (flag hanging from its pole). This viscous term keeps the cloth
+ * streaming with the airflow — mirrors Magica-style per-vertex air drag.
+ */
+export const STREAM_DRAG = 2.2;
+
 /** Static particle categories */
 export const STATIC_PINNED = 0; // never moves (invMass = 0, no external writes)
 export const STATIC_KINEMATIC = 1; // driven by engine targets each frame

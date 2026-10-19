@@ -145,7 +145,7 @@ export class ClothEngine {
     let dt = Math.min(dtSeconds, 1 / 30) * st.timeScale;
     if (dt <= 0) return;
 
-    // kinematic targets -> pool
+    // kinematic targets -> pool (+ GPU buffers)
     for (const cloth of this.cloths) {
       if (!cloth.consumeDirty()) continue;
       const idx = cloth.mesh.kinIndices;
@@ -160,6 +160,11 @@ export class ClothEngine {
         this.state.positions[p3 + 1] = cloth.kinCurr[k3 + 1];
         this.state.positions[p3 + 2] = cloth.kinCurr[k3 + 2];
       }
+      if (this.backend === "webgpu" && this.gpu) {
+        // GPU keeps its own copies of the driven particles — upload them here,
+        // otherwise the belt/skirt never follows the character on WebGPU.
+        this.gpu.writeKinematics(idx, cloth.offset, cloth.kinCurr, cloth.kinPrev);
+      }
     }
 
     const t0 = performance.now();
@@ -171,6 +176,9 @@ export class ClothEngine {
         if (this.gpu.generation === gen) {
           this.gpuFailed("NaN detected in GPU output");
         }
+        // NaN already poisoned the shared state — restore clean rest positions
+        // before running the CPU solver, otherwise NaN propagates forever.
+        this.restoreFromRest();
         this.cpu.step(dt, st, this.colliders);
       }
     } else {
@@ -212,8 +220,23 @@ export class ClothEngine {
     }
   }
 
+  /** Wipe poisoned sim state back to rest pose (per cloth, offset aware). */
+  private restoreFromRest() {
+    for (const cloth of this.cloths) {
+      const m = cloth.mesh;
+      const o3 = cloth.offset * 3;
+      const n3 = m.particleCount * 3;
+      this.state.positions.set(m.restPositions, o3);
+      this.state.prevPositions.set(m.restPositions, o3);
+      this.state.velocities.fill(0, o3, o3 + n3);
+    }
+    this.cpu.setState(this.state);
+    this.cpu.resetTime();
+  }
+
   private gpuFailed(reason: string) {
     if (this.backend === "cpu") return;
+    console.warn("[WebCloth] GPU fallback:", reason);
     this.gpuBroken = true;
     this.backend = "cpu";
     this.uploadAll();
@@ -241,6 +264,9 @@ export class ClothEngine {
       restLength: new Float32Array(nc),
       compliance: new Float32Array(nc),
       triAdj: new Uint32Array(n * ADJ_STRIDE).fill(0xffffffff),
+      consOffset: new Uint32Array(n + 1),
+      consOther: new Uint32Array(nc * 2),
+      consCon: new Uint32Array(nc * 2),
     };
     this.kinds = new Uint8Array(nc);
     const dS = stiffnessToCompliance(this.settings.distanceStiffness, false);
@@ -260,6 +286,15 @@ export class ClothEngine {
         const kind = m.constraintKind[c];
         this.kinds[co + c] = kind;
         state.compliance[co + c] = kind === 1 ? dB : dS;
+      }
+      // pool-global CSR: shift particle indices by cloth offset
+      const coN = m.particleCount;
+      for (let p = 0; p <= coN; p++) {
+        state.consOffset[o + p] = m.consOffset[p] + co * 2;
+      }
+      for (let e = 0; e < m.consOther.length; e++) {
+        state.consOther[co * 2 + e] = m.consOther[e] + o;
+        state.consCon[co * 2 + e] = m.consCon[e] + co;
       }
     }
     this.state = state;

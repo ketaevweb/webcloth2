@@ -49,12 +49,13 @@ export class CharacterScene implements ClothScene {
   camera = { pos: [2.1, 1.5, 2.9] as [number, number, number], target: [0, 1.0, 0] as [number, number, number] };
 
   private group = new THREE.Group();
-  private bodyMat = new THREE.MeshStandardMaterial({ color: 0x50565e, roughness: 0.55, metalness: 0.2 });
+  private bodyMat = new THREE.MeshStandardMaterial({ color: 0x7a818b, roughness: 0.5, metalness: 0.15 });
   private skirtMat = new THREE.MeshStandardMaterial({
     color: 0xd94f3d, side: THREE.DoubleSide, roughness: 0.8, metalness: 0.03,
   });
   private torso!: THREE.Mesh;
   private head!: THREE.Mesh;
+  private pelvis!: THREE.Mesh;
   private thighs: THREE.Mesh[] = [];
   private shins: THREE.Mesh[] = [];
   private upArms: THREE.Mesh[] = [];
@@ -91,6 +92,7 @@ export class CharacterScene implements ClothScene {
     this.torso = capsuleMesh(0.165, 0.6, this.bodyMat);
     this.torso.userData.boneLen = 0.6;
     this.head = new THREE.Mesh(new THREE.SphereGeometry(0.125, 20, 16), this.bodyMat);
+    this.pelvis = new THREE.Mesh(new THREE.SphereGeometry(0.235, 20, 16), this.bodyMat);
     for (let i = 0; i < 2; i++) {
       const th = capsuleMesh(0.085, 0.44, this.bodyMat); th.userData.boneLen = 0.44;
       const sh = capsuleMesh(0.068, 0.42, this.bodyMat); sh.userData.boneLen = 0.42;
@@ -99,7 +101,7 @@ export class CharacterScene implements ClothScene {
       this.thighs.push(th); this.shins.push(sh); this.upArms.push(ua); this.foreArms.push(fa);
       this.group.add(th, sh, ua, fa);
     }
-    this.group.add(this.torso, this.head);
+    this.group.add(this.torso, this.head, this.pelvis);
     scene.add(this.group);
 
     // skirt: open cylinder, top ring at local y = 0 (kinematic belt)
@@ -130,6 +132,7 @@ export class CharacterScene implements ClothScene {
 
     // pelvis & torso & head
     this.colPelvis.set(0, hipY + 0.03, 0);
+    this.pelvis.position.set(0, hipY + 0.03, 0);
     this.tmpA.set(0, hipY + 0.16, 0.02);
     this.tmpB.set(0, hipY + 0.76, 0.05);
     this.colTorso.setA(this.tmpA.x, this.tmpA.y, this.tmpA.z);

@@ -32,6 +32,10 @@ export interface BuiltMesh {
   attrToParticle: Uint32Array;
   /** per particle adjacent triangles as (b,c) vertex pairs */
   triAdj: Uint32Array;
+  /** CSR: per particle constraint list (pool-local; other+1 entry per endpoint) */
+  consOffset: Uint32Array; // n + 1
+  consOther: Uint32Array; // 2 * nc — the opposite particle of each entry
+  consCon: Uint32Array; // 2 * nc — the constraint index of each entry
   /** indices of kinematic particles + their rest positions */
   kinIndices: Uint32Array;
   kinRest: Float32Array; // xyz * K
@@ -155,6 +159,27 @@ export function buildSimMesh(
     tryAdj(triAdj, cursor, v2, v0, v1);
   }
 
+  // ---- CSR per particle constraint adjacency (race-free GPU solve) ----
+  // Every thread owns exactly one particle and iterates only its own
+  // constraints, writing solely to that particle — no write conflicts.
+  const degree = new Uint32Array(n + 1);
+  for (let c = 0; c < nc; c++) {
+    degree[constraintA[c] + 1]++;
+    degree[constraintB[c] + 1]++;
+  }
+  for (let p = 0; p < n; p++) degree[p + 1] += degree[p];
+  const consOffset = degree; // prefix sums => offsets, length n + 1
+  const consOther = new Uint32Array(nc * 2);
+  const consCon = new Uint32Array(nc * 2);
+  const fill = new Uint32Array(n);
+  for (let c = 0; c < nc; c++) {
+    const pa = constraintA[c], pb = constraintB[c];
+    let sa = consOffset[pa] + fill[pa]++;
+    consOther[sa] = pb; consCon[sa] = c;
+    let sb = consOffset[pb] + fill[pb]++;
+    consOther[sb] = pa; consCon[sb] = c;
+  }
+
   return {
     particleCount: n,
     constraintCount: nc,
@@ -168,6 +193,9 @@ export function buildSimMesh(
     triangles,
     attrToParticle,
     triAdj,
+    consOffset,
+    consOther,
+    consCon,
     kinIndices,
     kinRest,
     attrVertexCount,

@@ -20,6 +20,9 @@ export class WebGpuSolver {
   private velBuf!: GPUBuffer;
   private invMassBuf!: GPUBuffer;
   private constraintBuf!: GPUBuffer;
+  private consOffsetBuf!: GPUBuffer;
+  private consOtherBuf!: GPUBuffer;
+  private consConBuf!: GPUBuffer;
   private triAdjBuf!: GPUBuffer;
   private uniformBuf!: GPUBuffer;
   private staging: GPUBuffer[] = [];
@@ -45,6 +48,7 @@ export class WebGpuSolver {
   /** incremented on every pool rebuild; used to discard stale readbacks */
   generation = 0;
   private onFail: () => void;
+  private simTimeF32 = new Float32Array(1);
 
   private constructor(onFail: () => void) {
     this.onFail = onFail;
@@ -85,15 +89,6 @@ export class WebGpuSolver {
     return !!this.device;
   }
 
-  /** queue.writeBuffer with relaxed typed-array typing */
-  private wb(buffer: GPUBuffer, bufferOffset: number, data: ArrayBufferView, dataOffset?: number, size?: number) {
-    this.device.queue.writeBuffer(
-      buffer, bufferOffset,
-      data as unknown as GPUAllowSharedBufferSource,
-      dataOffset, size
-    );
-  }
-
   /** (Re)create pool buffers for a state and upload everything. */
   uploadState(s: SolverState) {
     const d = this.device;
@@ -106,6 +101,7 @@ export class WebGpuSolver {
 
     this.posBuf?.destroy(); this.prevBuf?.destroy(); this.velBuf?.destroy();
     this.invMassBuf?.destroy(); this.constraintBuf?.destroy(); this.triAdjBuf?.destroy();
+    this.consOffsetBuf?.destroy(); this.consOtherBuf?.destroy(); this.consConBuf?.destroy();
     for (const st of this.staging) { try { st.unmap(); } catch { /* not mapped */ } st.destroy(); }
     this.staging = [];
 
@@ -115,6 +111,9 @@ export class WebGpuSolver {
     this.invMassBuf = d.createBuffer({ size: Math.max(4, s.n * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.constraintBuf = d.createBuffer({ size: Math.max(4, conBytes), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.triAdjBuf = d.createBuffer({ size: Math.max(4, adjBytes), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.consOffsetBuf = d.createBuffer({ size: Math.max(4, s.consOffset.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.consOtherBuf = d.createBuffer({ size: Math.max(4, s.consOther.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.consConBuf = d.createBuffer({ size: Math.max(4, s.consCon.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     for (let i = 0; i < STAGING_COUNT; i++) {
       this.staging.push(d.createBuffer({ size: posBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }));
     }
@@ -130,12 +129,22 @@ export class WebGpuSolver {
       sf[0] = s.restLength[c]; conData[c * 4 + 2] = su[0];
       sf[0] = s.compliance[c]; conData[c * 4 + 3] = su[0];
     }
-    this.wb(this.posBuf, 0, s.positions);
-    this.wb(this.prevBuf, 0, s.prevPositions);
-    this.wb(this.velBuf, 0, s.velocities);
-    this.wb(this.invMassBuf, 0, s.invMass);
-    if (s.nc > 0) this.wb(this.constraintBuf, 0, conData);
-    if (s.n > 0) this.wb(this.triAdjBuf, 0, s.triAdj);
+    // NOTE: plain 3-argument writeBuffer calls only. Trailing undefined
+    // dataOffset/size arguments (or ArrayBuffer-style partial writes) proved
+    // unreliable on some Dawn/SwiftShader stacks — uploads silently landed as
+    // zeros there, collapsing the whole simulation.
+    const q = d.queue;
+    q.writeBuffer(this.posBuf, 0, s.positions as unknown as GPUAllowSharedBufferSource);
+    q.writeBuffer(this.prevBuf, 0, s.prevPositions as unknown as GPUAllowSharedBufferSource);
+    q.writeBuffer(this.velBuf, 0, s.velocities as unknown as GPUAllowSharedBufferSource);
+    q.writeBuffer(this.invMassBuf, 0, s.invMass as unknown as GPUAllowSharedBufferSource);
+    if (s.nc > 0) q.writeBuffer(this.constraintBuf, 0, conData);
+    if (s.n > 0) q.writeBuffer(this.triAdjBuf, 0, s.triAdj as unknown as GPUAllowSharedBufferSource);
+    q.writeBuffer(this.consOffsetBuf, 0, s.consOffset as unknown as GPUAllowSharedBufferSource);
+    if (s.consOther.byteLength > 0) {
+      q.writeBuffer(this.consOtherBuf, 0, s.consOther as unknown as GPUAllowSharedBufferSource);
+      q.writeBuffer(this.consConBuf, 0, s.consCon as unknown as GPUAllowSharedBufferSource);
+    }
 
     this.ensureUniform();
     this.buildPipelines();
@@ -162,6 +171,7 @@ export class WebGpuSolver {
     ]);
     this.bgSolve = group(this.pipeSolve, [
       [0, this.posBuf], [3, this.invMassBuf], [4, this.constraintBuf], [6, this.uniformBuf!],
+      [7, this.consOffsetBuf], [8, this.consOtherBuf], [9, this.consConBuf],
     ]);
     this.bgCollide = group(this.pipeCollide, [
       [0, this.posBuf], [2, this.velBuf], [3, this.invMassBuf], [6, this.uniformBuf!],
@@ -181,12 +191,14 @@ export class WebGpuSolver {
   }
 
   /** Write kinematic targets: positions <- curr, prevPositions <- prev (per index). */
-  writeKinematics(indices: Uint32Array, curr: Float32Array, prev: Float32Array) {
-    const d = this.device;
+  writeKinematics(indices: Uint32Array, indexOffset: number, curr: Float32Array, prev: Float32Array) {
+    const q = this.device.queue;
+    const c = curr as unknown as GPUAllowSharedBufferSource;
+    const p = prev as unknown as GPUAllowSharedBufferSource;
     for (let k = 0; k < indices.length; k++) {
-      const i3 = indices[k] * 3 * 4;
-      this.wb(this.posBuf, i3, curr, k * 3, 3);
-      this.wb(this.prevBuf, i3, prev, k * 3, 3);
+      const i3 = (indexOffset + indices[k]) * 3 * 4;
+      q.writeBuffer(this.posBuf, i3, c, k * 3, 3);
+      q.writeBuffer(this.prevBuf, i3, p, k * 3, 3);
     }
   }
 
@@ -222,22 +234,22 @@ export class WebGpuSolver {
       f32[o + 7] = col.kind === "sphere" ? 0 : col.kind === "capsule" ? 1 : 2;
       f32[o + 8] = col.nx; f32[o + 9] = col.ny; f32[o + 10] = col.nz; f32[o + 11] = 0;
     }
-    d.queue.writeBuffer(this.uniformBuf, 0, this.uniformData as unknown as GPUAllowSharedBufferSource);
+    d.queue.writeBuffer(this.uniformBuf, 0, this.uniformData);
 
     const nWg = Math.ceil(this.n / 64) || 1;
-    const cWg = Math.ceil(this.nc / 64) || 1;
     const encoder = d.createCommandEncoder();
     const pass = encoder.beginComputePass();
     for (let s = 0; s < substeps; s++) {
       this.simTime += h;
-      f32[15] = this.simTime;
-      d.queue.writeBuffer(this.uniformBuf, 60, this.uniformData as unknown as GPUAllowSharedBufferSource, 60, 4); // time only
+      this.simTimeF32[0] = this.simTime;
+      d.queue.writeBuffer(this.uniformBuf, 60, this.simTimeF32); // time only
       pass.setPipeline(this.pipeIntegrate);
       pass.setBindGroup(0, this.bgIntegrate);
       pass.dispatchWorkgroups(nWg);
+      // per-particle relaxation (race-free) — one sweep per iteration
       pass.setPipeline(this.pipeSolve);
       pass.setBindGroup(0, this.bgSolve);
-      for (let k = 0; k < iters; k++) pass.dispatchWorkgroups(cWg);
+      for (let k = 0; k < iters; k++) pass.dispatchWorkgroups(nWg);
       pass.setPipeline(this.pipeCollide);
       pass.setBindGroup(0, this.bgCollide);
       pass.dispatchWorkgroups(nWg);
@@ -245,10 +257,13 @@ export class WebGpuSolver {
       pass.setBindGroup(0, this.bgUpdateVel);
       pass.dispatchWorkgroups(nWg);
     }
-    // kick readback for THIS frame into staging[frameIndex % 2]
+    pass.end();
+    // kick readback for THIS frame into staging[frameIndex % 2].
+    // NOTE: copy commands MUST be encoded after pass.end() — the command
+    // encoder is locked while a pass is open, and any copy encoded there
+    // invalidates the whole command buffer (silently dropped on submit).
     const slot = this.frameIndex % STAGING_COUNT;
     encoder.copyBufferToBuffer(this.posBuf, 0, this.staging[slot], 0, this.n * 3 * 4);
-    pass.end();
     d.queue.submit([encoder.finish()]);
     this.frameIndex++;
     void hasKinematics;
@@ -273,15 +288,27 @@ export class WebGpuSolver {
       }
       const src = new Float32Array(buf.getMappedRange());
       let ok = true;
+      let firstNaN = -1;
       for (let i = 0; i < src.length; i++) {
         const v = src[i];
         dst[i] = v;
-        if (v !== v) ok = false;
+        if (v !== v && firstNaN < 0) { ok = false; firstNaN = i; }
+      }
+      if (!ok) {
+        const p = Math.floor(firstNaN / 3);
+        const c = firstNaN % 3;
+        console.warn(
+          `[WebCloth] NaN in readback: particle ${p} comp ${c}` +
+          ` | pos0-2: ${Array.from(src.slice(0, 9)).map((x) => x.toPrecision(4))}` +
+          ` | prev@p: ${Array.from(dst.slice(Math.max(0, firstNaN - 3), firstNaN + 6)).map((x) => x.toPrecision(4))}` +
+          ` | simTime ${this.simTime.toFixed(3)}`
+        );
       }
       buf.unmap();
       this.stagingMapped[slot] = false;
       return ok;
-    } catch {
+    } catch (e) {
+      console.warn("[WebCloth] staging map failed:", String(e).slice(0, 120));
       this.stagingMapped[slot] = false;
       return false;
     }

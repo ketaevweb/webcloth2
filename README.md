@@ -12,7 +12,7 @@ WebCloth 2 — оригинальная открытая реализация в
 
 ## Демо
 
-**Живая демонстрация:** https://zai-webcloth.github.io/webcloth2/
+**Живая демонстрация:** https://ketaevweb.github.io/webcloth2/
 
 В демо три сцены:
 

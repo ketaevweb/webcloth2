@@ -41,6 +41,9 @@ struct Params {
 @group(0) @binding(4) var<storage, read> constraints: array<u32>;
 @group(0) @binding(5) var<storage, read> triAdj: array<u32>;
 @group(0) @binding(6) var<uniform> params: Params;
+@group(0) @binding(7) var<storage, read> consOffset: array<u32>;
+@group(0) @binding(8) var<storage, read> consOther: array<u32>;
+@group(0) @binding(9) var<storage, read> consCon: array<u32>;
 
 fn loadPos(i: u32) -> vec3<f32> {
   let i3 = i * 3u;
@@ -113,7 +116,9 @@ fn windVel(p: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(0.0);
   }
   let gust = 1.0 + params.windParam.z * sin(t * 0.9 + p.x * 0.15 + p.y * 0.1);
-  let amp = params.windParam.y * strength;
+  // windParam.y is already turbulence * strength (packed by the CPU) —
+  // do NOT multiply by strength again or the noise explodes.
+  let amp = params.windParam.y;
   let fp = p * params.windParam.x;
   let tx = (vnoise(fp + vec3<f32>(t * 1.7, 0.0, 0.0)) - 0.5) * 2.0 * amp;
   let ty = (vnoise(fp + vec3<f32>(0.0, t * 1.3 + 3.7, 0.0)) - 0.5) * 2.0 * amp;
@@ -132,6 +137,10 @@ fn integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var f = vec3<f32>(0.0);
   if (params.dragParam.x > 0.0 && params.windDir.w > 0.0) {
+    let wv = windVel(p, v);
+    // per-particle viscous streaming drag (works even edge-on to the wind)
+    let lk = params.dragParam.x * 2.2;
+    f = (wv - v) * lk;
     let base = i * ADJ_STRIDE;
     for (var k: u32 = 0u; k < ADJ_STRIDE; k = k + 2u) {
       let ib = triAdj[base + k];
@@ -143,7 +152,7 @@ fn integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
       let area2 = length(cr);
       if (area2 > 1e-9) {
         let nn = cr / area2;
-        let relV = windVel(p, v) - v;
+        let relV = wv - v;
         let d = dot(nn, relV);
         // AERO_SCALE mirrors the CPU backend (acceleration units)
         f = f + nn * (d * area2 * 0.5 * params.dragParam.x / 3.0 * 600.0);
@@ -162,35 +171,42 @@ fn integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
   storePos(i, p + v * params.dt);
 }
 
+// Race-free per-particle XPBD relaxation: each thread owns exactly one
+// particle, iterates only its own constraints (CSR adjacency) and writes ONLY
+// that particle. Reads of neighbours may be stale (Jacobi/Gauss-Seidel hybrid)
+// but no correction is ever lost. Summing FULL per-constraint corrections
+// diverges on stiff lattices (classic Jacobi overshoot), so the sum is
+// under-relaxed by the particle degree 1/k.
 @compute @workgroup_size(64)
 fn solve(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let c = gid.x;
-  if (c >= params.nc) { return; }
-  let ia = constraints[c * 4u];
-  let ib = constraints[c * 4u + 1u];
-  let rest = bitcast<f32>(constraints[c * 4u + 2u]);
-  let compliance = bitcast<f32>(constraints[c * 4u + 3u]);
-  let wa = invMass[ia];
-  let wb = invMass[ib];
-  let wsum = wa + wb;
-  if (wsum <= 0.0) { return; }
-  let pa = loadPos(ia);
-  let pb = loadPos(ib);
-  let d = pb - pa;
-  let len = length(d);
-  if (len < 1e-9) { return; }
-  let n = d / len;
-  let C = len - rest;
-  let alphaT = compliance * params.invDt * params.invDt;
-  // XPBD: dl = C / (wsum + compliance/dt^2); pa += n*dl*wa; pb -= n*dl*wb
-  let dl = C / (wsum + alphaT);
-  let dpa = n * (dl * wa);
-  let dpb = -n * (dl * wb);
-  // read-modify-write (relaxed; acceptable for interactive cloth)
-  let na = loadPos(ia) + dpa;
-  let nb = loadPos(ib) + dpb;
-  storePos(ia, na);
-  storePos(ib, nb);
+  let i = gid.x;
+  if (i >= params.n) { return; }
+  let w = invMass[i];
+  if (w <= 0.0) { return; }
+  let p = loadPos(i);
+  var dp = vec3<f32>(0.0);
+  let start = consOffset[i];
+  let end = consOffset[i + 1u];
+  let k = max(1u, end - start);
+  for (var e = start; e < end; e = e + 1u) {
+    let j = consOther[e];
+    let wj = invMass[j];
+    let wsum = w + wj;
+    if (wsum <= 0.0) { continue; }
+    let ci = consCon[e];
+    let rest = bitcast<f32>(constraints[ci * 4u + 2u]);
+    let compliance = bitcast<f32>(constraints[ci * 4u + 3u]);
+    let pj = loadPos(j);
+    let d = pj - p;
+    let len = length(d);
+    if (len < 1e-9) { continue; }
+    let C = len - rest;
+    let alphaT = compliance * params.invDt * params.invDt;
+    // XPBD: dl = C / (wsum + compliance/dt^2); this particle moves dl * w
+    let dl = C / (wsum + alphaT);
+    dp = dp + (d / len) * (dl * w);
+  }
+  storePos(i, p + dp / f32(k));
 }
 
 @compute @workgroup_size(64)

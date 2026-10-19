@@ -6,7 +6,7 @@ import {
   Cpu, GitBranch, Hand, Layers, Sparkles, Waves, Wind, Zap,
 } from "lucide-react";
 
-const GITHUB_URL = "https://github.com/zai-webcloth/webcloth2";
+const GITHUB_URL = "https://github.com/ketaevweb/webcloth2";
 
 const FEATURES = [
   {

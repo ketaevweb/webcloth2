@@ -5,7 +5,7 @@
  */
 import { vnoise } from "./noise";
 import { ADJ_STRIDE, SENTINEL } from "./ClothBuilder";
-import { AERO_SCALE, type ColliderLike, type EngineSettings } from "./types";
+import { AERO_SCALE, STREAM_DRAG, type ColliderLike, type EngineSettings } from "./types";
 
 export interface SolverState {
   n: number;
@@ -19,6 +19,10 @@ export interface SolverState {
   restLength: Float32Array;
   compliance: Float32Array; // precomputed per constraint from stiffness
   triAdj: Uint32Array;
+  /** CSR per-particle constraint adjacency (used by the WebGPU solve kernel) */
+  consOffset: Uint32Array; // n + 1, entry ranges per particle
+  consOther: Uint32Array; // 2 * nc, opposite particle (pool-global)
+  consCon: Uint32Array; // 2 * nc, constraint index (pool-global)
 }
 
 export class CpuSolver {
@@ -78,9 +82,22 @@ export class CpuSolver {
       const px = positions[i3], py = positions[i3 + 1], pz = positions[i3 + 2];
       let vx = velocities[i3], vy = velocities[i3 + 1], vz = velocities[i3 + 2];
 
-      // aerodynamic wind force through adjacent triangles
+      // aerodynamic wind force through adjacent triangles + streaming drag
       let fx = 0, fy = 0, fz = 0;
       if (drag > 0 && strength > 0) {
+        const gust = 1 + gustAmp * Math.sin(t * 0.9 + px * 0.15 + py * 0.1);
+        const wf = freq;
+        const tx = (vnoise(px * wf + t * 1.7, py * wf, pz * wf) - 0.5) * 2 * turbAmp;
+        const ty = (vnoise(px * wf, py * wf + t * 1.3 + 3.7, pz * wf) - 0.5) * 2 * turbAmp;
+        const tz = (vnoise(px * wf + 5.1, py * wf, pz * wf + t * 2.3) - 0.5) * 2 * turbAmp;
+        const wvx = dirX * strength * gust + tx;
+        const wvy = ty;
+        const wvz = dirZ * strength * gust + tz;
+        // per-particle viscous streaming drag (works even edge-on to the wind)
+        const lk = drag * STREAM_DRAG;
+        fx = (wvx - vx) * lk;
+        fy = (wvy - vy) * lk;
+        fz = (wvz - vz) * lk;
         const base = i * ADJ_STRIDE;
         for (let k = 0; k < ADJ_STRIDE; k += 2) {
           const ib = triAdj[base + k];
@@ -95,15 +112,6 @@ export class CpuSolver {
           const area2 = Math.sqrt(nx * nx + ny * ny + nz * nz);
           if (area2 < 1e-9) continue;
           nx /= area2; ny /= area2; nz /= area2;
-          // wind velocity at particle
-          const gust = 1 + gustAmp * Math.sin(t * 0.9 + px * 0.15 + py * 0.1);
-          const wf = freq;
-          const tx = (vnoise(px * wf + t * 1.7, py * wf, pz * wf) - 0.5) * 2 * turbAmp;
-          const ty = (vnoise(px * wf, py * wf + t * 1.3 + 3.7, pz * wf) - 0.5) * 2 * turbAmp;
-          const tz = (vnoise(px * wf + 5.1, py * wf, pz * wf + t * 2.3) - 0.5) * 2 * turbAmp;
-          const wvx = dirX * strength * gust + tx;
-          const wvy = ty;
-          const wvz = dirZ * strength * gust + tz;
           // relative airflow through the surface
           const d = nx * (wvx - vx) + ny * (wvy - vy) + nz * (wvz - vz);
           const c = d * area2 * 0.5 * drag * AERO_SCALE / 3;

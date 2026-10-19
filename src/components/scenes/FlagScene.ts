@@ -13,9 +13,9 @@ export class FlagScene implements ClothScene {
   name = "Флаг";
   description = "Большое полотнище на мачте: аэродинамика ветра и турбулентность";
   defaults: Partial<EngineSettings> = {
-    windStrength: 9,
-    windTurbulence: 0.55,
-    windGust: 0.4,
+    windStrength: 10.5,
+    windTurbulence: 0.62,
+    windGust: 0.45,
     windDirX: 0.22,
     windDirZ: 1,
     aeroDrag: 0.85,
