@@ -1,0 +1,27 @@
+node_modules
+.next
+.next-export
+out
+db
+*.log
+dev.log
+server.log
+download
+scripts
+skills
+examples
+tests
+worklog.md
+.agent-browser
+.DS_Store
+gh-deploy-tmp
+.next-pages
+
+# sandbox artifacts
+.env
+.zscripts
+Caddyfile
+download
+mini-services
+prisma
+db
