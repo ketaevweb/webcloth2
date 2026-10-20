@@ -73,7 +73,7 @@ export default function Home() {
           <div className="flex items-center gap-2">
             <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-orange-500 to-red-500 text-[13px] font-black text-white">W</span>
             <span className="font-semibold tracking-tight">WebCloth 2</span>
-            <Badge variant="secondary" className="ml-1 hidden h-5 px-1.5 text-[10px] sm:inline-flex">v2.0</Badge>
+            <Badge variant="secondary" className="ml-1 hidden h-5 px-1.5 text-[10px] sm:inline-flex">v2.0.1</Badge>
           </div>
           <nav className="flex items-center gap-4 text-sm text-neutral-400">
             <a href="#demo" className="transition-colors hover:text-neutral-100">Демо</a>

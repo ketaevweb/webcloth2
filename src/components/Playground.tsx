@@ -58,6 +58,8 @@ export default function Playground() {
   const [fallbackMsg, setFallbackMsg] = useState<string | null>(null);
   const [wireframe, setWireframe] = useState(false);
   const [panelOpen, setPanelOpen] = useState(true);
+  const [fatalError, setFatalError] = useState<string | null>(null);
+  const buildId = (process.env.NEXT_PUBLIC_BUILD_ID as string | undefined) || "dev";
 
   // ---- init once ----
   useEffect(() => {
@@ -66,7 +68,20 @@ export default function Playground() {
     if (!holder) return;
 
     (async () => {
-      const engine = await ClothEngine.create();
+      let engine: ClothEngine;
+      try {
+        // Guard against adapters that never resolve requestAdapter() (rare
+        // driver bug): abort into a visible error instead of an eternal spinner.
+        engine = await Promise.race([
+          ClothEngine.create(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Не удалось инициализировать GPU/CPU-движок за 12 с")), 12000)
+          ),
+        ]);
+      } catch (e) {
+        if (!disposed) setFatalError(e instanceof Error ? e.message : String(e));
+        return;
+      }
       if (disposed) { engine.dispose(); return; }
       engine.onFallback = (reason) => {
         setBackend("cpu");
@@ -74,7 +89,19 @@ export default function Playground() {
       };
       engine.settings = { ...settings };
 
-      const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+      let renderer: THREE.WebGLRenderer;
+      try {
+        renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+      } catch (e) {
+        if (!disposed) {
+          setFatalError(
+            "Не удалось создать WebGL 2 контекст — браузер блокирует аппаратный ускоритель. " +
+            "Включите аппаратное ускорение в настройках или откройте демо в другом браузере."
+          );
+        }
+        engine.dispose();
+        return;
+      }
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
       renderer.setSize(holder.clientWidth, holder.clientHeight);
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -253,6 +280,9 @@ export default function Playground() {
           </Badge>
           <span className="max-w-[130px] truncate text-neutral-500">{stats.adapter}</span>
         </div>
+        <div className="text-neutral-600" title="Идентификатор сборки — сверяйте, что видите свежую версию">
+          сборка {buildId}
+        </div>
       </div>
 
       {/* panel toggle (mobile) */}
@@ -358,6 +388,24 @@ export default function Playground() {
             <Button size="sm" variant={wireframe ? "default" : "secondary"} className="h-8 text-[11px]"
               onClick={toggleWireframe}>
               <Grid3x3 className="mr-1 h-3.5 w-3.5" /> Каркас
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* fatal init error */}
+      {fatalError && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/90 p-6">
+          <div className="max-w-md rounded-xl border border-red-500/30 bg-red-950/70 p-5 text-center">
+            <TriangleAlert className="mx-auto mb-2 h-7 w-7 text-red-400" />
+            <h3 className="mb-1 text-sm font-semibold text-red-100">Демо не смогло запуститься</h3>
+            <p className="text-xs leading-relaxed text-red-200/80">{fatalError}</p>
+            <p className="mt-3 text-[11px] text-neutral-400">
+              Попробуйте жёсткое обновление (Ctrl+F5 / Cmd+Shift+R) или другой браузер:
+              Chrome / Edge / Firefox 125+.
+            </p>
+            <Button size="sm" variant="secondary" className="mt-3 h-8" onClick={() => window.location.reload()}>
+              <RotateCcw className="mr-1 h-3.5 w-3.5" /> Перезагрузить
             </Button>
           </div>
         </div>

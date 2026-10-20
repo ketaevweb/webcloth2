@@ -171,8 +171,8 @@ export class ClothEngine {
     if (this.backend === "webgpu" && this.gpu) {
       const gen = this.gpu.generation;
       this.gpu.step(dt, st, this.colliders, false);
-      const ok = await this.gpu.readback(this.state.positions);
-      if (!ok) {
+      const rb = await this.gpu.readback(this.state.positions);
+      if (rb === "nan") {
         if (this.gpu.generation === gen) {
           this.gpuFailed("NaN detected in GPU output");
         }
@@ -181,6 +181,9 @@ export class ClothEngine {
         this.restoreFromRest();
         this.cpu.step(dt, st, this.colliders);
       }
+      // "aborted": staging buffers were recreated mid-flight (backend toggle or
+      // pool rebuild). The fresh pool already holds a clean rest state and the
+      // active backend steps normally next frame — nothing to recover here.
     } else {
       this.cpu.step(dt, st, this.colliders);
     }

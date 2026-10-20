@@ -273,14 +273,19 @@ export class WebGpuSolver {
 
   /**
    * Await mapped results of the previous frame (double buffered) and copy them
-   * into `dst`. Returns false when NaN corruption is detected (triggers fallback).
+   * into `dst`.
+   *  - "ok"     — data copied, no corruption;
+   *  - "nan"    — data copied but contains NaN (poisons shared state);
+   *  - "aborted"— pending map was cancelled because buffers were recreated
+   *               mid-flight (backend toggle / pool rebuild). Shared state was
+   *               NOT touched — the caller must not run recovery for it.
    */
-  async readback(dst: Float32Array): Promise<boolean> {
-    if (this.n === 0) return true;
+  async readback(dst: Float32Array): Promise<"ok" | "nan" | "aborted"> {
+    if (this.n === 0) return "ok";
     // data of the just-submitted frame lives in staging[(frameIndex-1) % 2]
     const slot = (this.frameIndex - 1 + STAGING_COUNT * 4) % STAGING_COUNT;
     const buf = this.staging[slot];
-    if (!buf) return true;
+    if (!buf) return "ok";
     try {
       if (!this.stagingMapped[slot]) {
         await buf.mapAsync(GPUMapMode.READ);
@@ -306,11 +311,11 @@ export class WebGpuSolver {
       }
       buf.unmap();
       this.stagingMapped[slot] = false;
-      return ok;
+      return ok ? "ok" : "nan";
     } catch (e) {
       console.warn("[WebCloth] staging map failed:", String(e).slice(0, 120));
       this.stagingMapped[slot] = false;
-      return false;
+      return "aborted";
     }
   }
 
