@@ -40,6 +40,16 @@ export interface BuiltMesh {
   kinIndices: Uint32Array;
   kinRest: Float32Array; // xyz * K
   attrVertexCount: number;
+  /** average structural edge length — base for self-collision radius */
+  avgSpacing: number;
+  /**
+   * Tearing support: for every STRUCTURAL constraint, the up-to-2 triangle
+   * indices (attribute space, i.e. positions inside geometry.index) sharing
+   * that edge; -1 when absent. Length = structuralCount * 2.
+   */
+  structTris: Int32Array;
+  /** For every BENDING constraint: owning structural constraint index; -1 if orphaned */
+  bendStruct: Int32Array;
 }
 
 export function buildSimMesh(
@@ -105,17 +115,18 @@ export function buildSimMesh(
   }
 
   // ---- constraints ----
-  const edgeMap = new Map<number, number>(); // packed edge -> exists
+  const edgeMap = new Map<number, number>(); // packed edge -> structural constraint index
   const bendMap = new Map<number, number>(); // packed edge -> first opposite vertex
   const a: number[] = [], b: number[] = [];
+  const structTrisRaw: Array<[number, number]> = []; // per structural constraint
   for (let t = 0; t < triCount; t++) {
     const i0 = attrToParticle[index[t * 3]];
     const i1 = attrToParticle[index[t * 3 + 1]];
     const i2 = attrToParticle[index[t * 3 + 2]];
     if (i0 === i1 || i1 === i2 || i0 === i2) continue; // degenerate after weld
-    addEdge(edgeMap, a, b, i0, i1);
-    addEdge(edgeMap, a, b, i1, i2);
-    addEdge(edgeMap, a, b, i2, i0);
+    addEdge(edgeMap, a, b, structTrisRaw, t, i0, i1);
+    addEdge(edgeMap, a, b, structTrisRaw, t, i1, i2);
+    addEdge(edgeMap, a, b, structTrisRaw, t, i2, i0);
   }
   // bending: opposite vertices across every interior edge
   for (let t = 0; t < triCount; t++) {
@@ -132,6 +143,32 @@ export function buildSimMesh(
   const constraintB = new Uint32Array(b);
   const constraintKind = new Uint8Array(nc);
   const restLength = new Float32Array(nc);
+  const bendStruct = new Int32Array(nc - structuralCount).fill(-1);
+  const edgeKeyToStruct = new Map<number, number>();
+  {
+    let si = 0;
+    for (const [key] of edgeMap) edgeKeyToStruct.set(key, si++);
+  }
+  // map every bending constraint to the structural constraint of its shared edge
+  {
+    let bi = 0;
+    for (let c = structuralCount; c < nc; c++, bi++) {
+      const lo = Math.min(constraintA[c], constraintB[c]);
+      const hi = Math.max(constraintA[c], constraintB[c]);
+      const owner = edgeKeyToStruct.get(lo * PACK + hi);
+      bendStruct[bi] = owner === undefined ? -1 : owner;
+    }
+  }
+  // pack structural -> adjacent attribute-space triangles
+  const structTris = new Int32Array(structuralCount * 2).fill(-1);
+  for (let s = 0; s < structuralCount; s++) {
+    structTris[s * 2] = structTrisRaw[s][0];
+    structTris[s * 2 + 1] = structTrisRaw[s][1];
+  }
+  // average structural edge length -> self-collision radius base
+  let edgeSum = 0;
+  for (let c = 0; c < structuralCount; c++) edgeSum += restLength[c];
+  const avgSpacing = structuralCount > 0 ? edgeSum / structuralCount : 0.05;
   for (let c = 0; c < nc; c++) {
     const isBend = c >= structuralCount;
     constraintKind[c] = isBend ? 1 : 0;
@@ -199,19 +236,32 @@ export function buildSimMesh(
     kinIndices,
     kinRest,
     attrVertexCount,
+    avgSpacing,
+    structTris,
+    bendStruct,
   };
 }
 
 function addEdge(
   edgeMap: Map<number, number>,
   a: number[], b: number[],
+  structTrisRaw: Array<[number, number]>,
+  tri: number,
   i0: number, i1: number
-) {
+): number {
   const lo = Math.min(i0, i1), hi = Math.max(i0, i1);
   const key = lo * PACK + hi;
-  if (edgeMap.has(key)) return;
-  edgeMap.set(key, 1);
+  const existing = edgeMap.get(key);
+  if (existing !== undefined) {
+    // second triangle for this edge (or later) — remember it for tearing
+    if (structTrisRaw[existing][1] === -1) structTrisRaw[existing][1] = tri;
+    return existing;
+  }
+  const idx = a.length;
+  edgeMap.set(key, idx);
   a.push(lo); b.push(hi);
+  structTrisRaw.push([tri, -1]);
+  return idx;
 }
 
 function addBend(

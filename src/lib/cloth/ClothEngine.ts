@@ -1,13 +1,18 @@
 /**
  * WebCloth 2 — engine facade.
  * Manages the particle/constraint pool, backend selection (WebGPU compute or
- * CPU XPBD), kinematic targets, colliders, wind settings and geometry sync.
+ * CPU XPBD), kinematic targets, colliders, wind settings, geometry sync,
+ * tearing and the bone-cloth (chain) system.
  */
 import * as THREE from "three";
 import { buildSimMesh, stiffnessToCompliance, ADJ_STRIDE, type BuiltMesh } from "./ClothBuilder";
 import { CpuSolver, type SolverState } from "./CpuSolver";
 import { WebGpuSolver } from "./WebGpuSolver";
-import { DEFAULT_SETTINGS, MAX_COLLIDERS, type BackendKind, type ClothBuildOptions, type ColliderLike, type EngineSettings } from "./types";
+import { BoneChain, BoneClothSystem, type BoneChainOptions } from "./BoneCloth";
+import { DEFAULT_SETTINGS, MAX_COLLIDERS, SELF_RADIUS_SCALE, type BackendKind, type ClothBuildOptions, type ColliderLike, type EngineSettings } from "./types";
+
+/** bit 31 of the packed constraint word 0 marks a tearable (structural) link */
+export const TEARABLE_BIT = 0x80000000;
 
 export class Cloth {
   readonly mesh: BuiltMesh;
@@ -20,6 +25,10 @@ export class Cloth {
   smoothNormals = true;
   /** @internal */
   kinDirty = false;
+  /** per local structural constraint -> list of local bend constraint indices */
+  bendsByStruct: number[][] = [];
+  /** copy of the attribute-space index buffer to restore after tearing */
+  originalIndex: Uint32Array | null = null;
 
   constructor(geometry: THREE.BufferGeometry, mesh: BuiltMesh) {
     this.geometry = geometry;
@@ -30,6 +39,16 @@ export class Cloth {
     this.kinTmp = new Float32Array(k * 3);
     this.kinPrev.set(mesh.kinRest);
     this.kinCurr.set(mesh.kinRest);
+    // tear bookkeeping
+    const bends: number[][] = [];
+    for (let bi = 0; bi < mesh.bendStruct.length; bi++) {
+      const owner = mesh.bendStruct[bi];
+      if (owner < 0) continue;
+      (bends[owner] ??= []).push(mesh.structuralCount + bi);
+    }
+    this.bendsByStruct = bends;
+    const idx = geometry.getIndex();
+    this.originalIndex = idx ? new Uint32Array(idx.array as ArrayLike<number>) : null;
   }
 
   /** Compute this frame's kinematic target positions from particle rest positions. */
@@ -60,7 +79,7 @@ export class ClothEngine {
   backend: BackendKind = "cpu";
   cloths: Cloth[] = [];
   colliders: ColliderLike[] = [];
-  stats = { particles: 0, constraints: 0, triangles: 0, simMs: 0, adapter: "" };
+  stats = { particles: 0, constraints: 0, triangles: 0, bones: 0, simMs: 0, adapter: "" };
   onFallback: ((reason: string) => void) | null = null;
 
   private state!: SolverState;
@@ -69,6 +88,11 @@ export class ClothEngine {
   private gpu: WebGpuSolver | null = null;
   private gpuBroken = false;
   private time = 0;
+  private bones = new BoneClothSystem();
+  /** tear flags processed at least once (avoid redoing geometry work) */
+  private handled: Uint8Array = new Uint8Array(0);
+  /** GPU readback scratch for broken flags */
+  private gpuFlags: Uint32Array = new Uint32Array(0);
 
   static async create(): Promise<ClothEngine> {
     const e = new ClothEngine();
@@ -82,6 +106,8 @@ export class ClothEngine {
     return "CPU (WebGL2 fallback)";
   }
 
+  // ---- mesh cloth ----
+
   addCloth(geometry: THREE.BufferGeometry, opts: AddClothOptions = {}): Cloth {
     const mesh = buildSimMesh(geometry, opts);
     const cloth = new Cloth(geometry, mesh);
@@ -91,17 +117,36 @@ export class ClothEngine {
     return cloth;
   }
 
+  clearCloths() {
+    this.cloths = [];
+    this.rebuildPool();
+  }
+
+  // ---- bone cloth ----
+
+  addBoneChain(opts: BoneChainOptions): BoneChain {
+    const chain = this.bones.add(new BoneChain(opts));
+    this.stats.bones = this.bones.jointCount;
+    return chain;
+  }
+
+  clearBoneChains() {
+    this.bones.clear();
+    this.stats.bones = 0;
+  }
+
+  get boneChainCount(): number {
+    return this.bones.chains.length;
+  }
+
+  // ---- colliders ----
+
   addCollider(c: ColliderLike) {
     if (this.colliders.length < MAX_COLLIDERS) this.colliders.push(c);
   }
 
   clearColliders() {
     this.colliders = [];
-  }
-
-  clearCloths() {
-    this.cloths = [];
-    this.rebuildPool();
   }
 
   setBackend(b: BackendKind) {
@@ -132,7 +177,17 @@ export class ClothEngine {
       this.state.velocities.fill(0, o3, o3 + n3);
       cloth.kinPrev.set(m.kinRest);
       cloth.kinCurr.set(m.kinRest);
+      // restore torn triangles
+      const idxAttr = cloth.geometry.getIndex();
+      if (idxAttr && cloth.originalIndex) {
+        (idxAttr.array as Uint16Array | Uint32Array).set(cloth.originalIndex);
+        idxAttr.needsUpdate = true;
+      }
     }
+    this.state.broken.fill(0);
+    this.handled.fill(0);
+    this.gpu?.resetBroken();
+    this.bones.reset();
     this.time = 0;
     this.cpu.resetTime();
     this.gpu?.resetTime();
@@ -144,6 +199,11 @@ export class ClothEngine {
     if (st.paused) return;
     let dt = Math.min(dtSeconds, 1 / 30) * st.timeScale;
     if (dt <= 0) return;
+
+    // bone chains first: they share colliders and settings with mesh cloth
+    if (this.bones.chains.length > 0) {
+      this.bones.step(dt, st, this.colliders);
+    }
 
     // kinematic targets -> pool (+ GPU buffers)
     for (const cloth of this.cloths) {
@@ -184,12 +244,61 @@ export class ClothEngine {
       // "aborted": staging buffers were recreated mid-flight (backend toggle or
       // pool rebuild). The fresh pool already holds a clean rest state and the
       // active backend steps normally next frame — nothing to recover here.
+      if (st.tearFactor > 0 && this.state.nc > 0) {
+        const flagsOk = await this.gpu.readbackBroken(this.gpuFlags);
+        this.processTears(flagsOk ? this.gpuFlags : undefined);
+      }
     } else {
       this.cpu.step(dt, st, this.colliders);
+      if (st.tearFactor > 0 && this.state.nc > 0) this.processTears();
     }
     this.time += dt;
     this.stats.simMs = this.stats.simMs * 0.9 + (performance.now() - t0) * 0.1;
     this.syncGeometries();
+  }
+
+  /**
+   * Consume broken flags (CPU marks + optional GPU readback), remove the
+   * triangles of torn structural edges and cascade dependent bend links.
+   */
+  private processTears(gpuFlags?: Uint32Array) {
+    const st = this.state;
+    for (const cloth of this.cloths) {
+      const mesh = cloth.mesh;
+      const base = cloth.constraintOffset;
+      const idxAttr = cloth.geometry.getIndex();
+      let indexDirty = false;
+      for (let local = 0; local < mesh.constraintCount; local++) {
+        const c = base + local;
+        if (gpuFlags && gpuFlags[c] === 1 && st.broken[c] === 0) st.broken[c] = 1;
+        if (st.broken[c] === 0 || this.handled[c] === 1) continue;
+        this.handled[c] = 1;
+        if (local >= mesh.structuralCount) continue; // bend link: nothing extra
+        // remove both triangles adjacent to the torn edge (degenerate => invisible)
+        if (idxAttr) {
+          const t0 = mesh.structTris[local * 2];
+          const t1 = mesh.structTris[local * 2 + 1];
+          const arr = idxAttr.array as Uint16Array | Uint32Array;
+          if (t0 >= 0) { arr[t0 * 3] = 0; arr[t0 * 3 + 1] = 0; arr[t0 * 3 + 2] = 0; indexDirty = true; }
+          if (t1 >= 0) { arr[t1 * 3] = 0; arr[t1 * 3 + 1] = 0; arr[t1 * 3 + 2] = 0; indexDirty = true; }
+        }
+        // cascade: bends spanning the torn edge are broken too
+        const bends = cloth.bendsByStruct[local];
+        if (bends && bends.length) {
+          const gpuList: number[] = [];
+          for (const bl of bends) {
+            const bc = base + bl;
+            if (st.broken[bc] === 0) {
+              st.broken[bc] = 1;
+              this.handled[bc] = 1;
+              if (this.backend === "webgpu" && this.gpu) gpuList.push(bc);
+            }
+          }
+          if (gpuList.length) this.gpu?.writeBroken(gpuList);
+        }
+      }
+      if (indexDirty && idxAttr) idxAttr.needsUpdate = true;
+    }
   }
 
   private syncGeometries() {
@@ -270,8 +379,13 @@ export class ClothEngine {
       consOffset: new Uint32Array(n + 1),
       consOther: new Uint32Array(nc * 2),
       consCon: new Uint32Array(nc * 2),
+      radius: new Float32Array(n),
+      broken: new Uint8Array(nc),
+      breakable: new Uint8Array(nc),
     };
     this.kinds = new Uint8Array(nc);
+    this.handled = new Uint8Array(nc);
+    this.gpuFlags = new Uint32Array(nc);
     const dS = stiffnessToCompliance(this.settings.distanceStiffness, false);
     const dB = stiffnessToCompliance(this.settings.bendStiffness, true);
     for (const cloth of this.cloths) {
@@ -285,10 +399,12 @@ export class ClothEngine {
       state.constraintA.set(m.constraintA, co);
       state.constraintB.set(m.constraintB, co);
       state.restLength.set(m.restLength, co);
+      state.radius.fill(SELF_RADIUS_SCALE * m.avgSpacing, o, o + m.particleCount);
       for (let c = 0; c < m.constraintCount; c++) {
         const kind = m.constraintKind[c];
         this.kinds[co + c] = kind;
         state.compliance[co + c] = kind === 1 ? dB : dS;
+        state.breakable[co + c] = kind === 0 ? 1 : 0;
       }
       // pool-global CSR: shift particle indices by cloth offset
       const coN = m.particleCount;
@@ -311,5 +427,6 @@ export class ClothEngine {
     this.gpu?.destroy();
     this.gpu = null;
     this.cloths = [];
+    this.bones.clear();
   }
 }

@@ -27,10 +27,13 @@ struct Params {
   windDir: vec4<f32>,    // xyz normalized, w = strength
   windParam: vec4<f32>,  // x freq, y turbulence, z gust, w time
   dragParam: vec4<f32>,  // x aeroDrag, y damping, z maxVelocity, w friction
+  tearParam: vec4<f32>,  // x tearFactor (0 = off), y selfRadiusScale, z,w spare
   colliderCount: u32,
-  pad0: u32,
-  pad1: u32,
-  pad2: u32,
+  gridX: u32,
+  gridY: u32,
+  gridZ: u32,
+  gridOrigin: vec4<f32>, // xyz min corner
+  gridParam: vec4<f32>,  // x cellSize, y maxRadius, z,w spare
   colliders: array<vec4<f32>, 48>, // 3 vec4 per collider, max 16
 }
 
@@ -44,6 +47,12 @@ struct Params {
 @group(0) @binding(7) var<storage, read> consOffset: array<u32>;
 @group(0) @binding(8) var<storage, read> consOther: array<u32>;
 @group(0) @binding(9) var<storage, read> consCon: array<u32>;
+@group(0) @binding(10) var<storage, read_write> consBroken: array<atomic<u32>>;
+@group(0) @binding(11) var<storage, read> radius: array<f32>;
+@group(0) @binding(12) var<storage, read_write> cellCount: array<atomic<u32>>;
+@group(0) @binding(13) var<storage, read_write> cellParticles: array<u32>;
+
+const CELL_CAP: u32 = 16u;
 
 fn loadPos(i: u32) -> vec3<f32> {
   let i3 = i * 3u;
@@ -194,6 +203,7 @@ fn solve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wsum = w + wj;
     if (wsum <= 0.0) { continue; }
     let ci = consCon[e];
+    if (atomicLoad(&consBroken[ci]) != 0u) { continue; }
     let rest = bitcast<f32>(constraints[ci * 4u + 2u]);
     let compliance = bitcast<f32>(constraints[ci * 4u + 3u]);
     let pj = loadPos(j);
@@ -201,10 +211,20 @@ fn solve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let len = length(d);
     if (len < 1e-9) { continue; }
     let C = len - rest;
+    // tearing: only tearable (structural) constraints break — flagged by bit 31
+    // of the packed word 0 — and only when stretched beyond rest*tearFactor.
+    // Broken links are skipped; the engine cascades dependent bends + removes
+    // triangles when it processes the readback flag array each frame.
+    let over = params.tearParam.x > 0.0
+      && (constraints[ci * 4u] >> 31u) == 1u
+      && len > rest * params.tearParam.x;
     let alphaT = compliance * params.invDt * params.invDt;
     // XPBD: dl = C / (wsum + compliance/dt^2); this particle moves dl * w
     let dl = C / (wsum + alphaT);
     dp = dp + (d / len) * (dl * w);
+    if (over && atomicLoad(&consBroken[ci]) == 0u) {
+      atomicStore(&consBroken[ci], 1u);
+    }
   }
   storePos(i, p + dp / f32(k));
 }
@@ -287,5 +307,81 @@ fn updateVelocity(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   storeVel(i, v);
+}
+
+// ---- self / cross-cloth particle collision (uniform grid, fixed capacity) ----
+
+fn cellIndexOf(p: vec3<f32>) -> u32 {
+  let rel = (p - params.gridOrigin.xyz) / max(params.gridParam.x, 1e-5);
+  let cx = min(params.gridX - 1u, u32(max(rel.x, 0.0)));
+  let cy = min(params.gridY - 1u, u32(max(rel.y, 0.0)));
+  let cz = min(params.gridZ - 1u, u32(max(rel.z, 0.0)));
+  return cx + cy * params.gridX + cz * params.gridX * params.gridY;
+}
+
+@compute @workgroup_size(64)
+fn clearCells(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let cells = params.gridX * params.gridY * params.gridZ;
+  if (gid.x >= cells) { return; }
+  atomicStore(&cellCount[gid.x], 0u);
+}
+
+@compute @workgroup_size(64)
+fn scatterCells(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.n) { return; }
+  if (invMass[i] <= 0.0) { return; }
+  if (radius[i] <= 0.0) { return; }
+  let cell = cellIndexOf(loadPos(i));
+  let slot = atomicAdd(&cellCount[cell], 1u);
+  if (slot < CELL_CAP) {
+    cellParticles[cell * CELL_CAP + slot] = i;
+  }
+}
+
+@compute @workgroup_size(64)
+fn selfCollide(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.n) { return; }
+  let w = invMass[i];
+  if (w <= 0.0) { return; }
+  let ri = radius[i];
+  if (ri <= 0.0) { return; }
+  var p = loadPos(i);
+  let cell = cellIndexOf(p);
+  let cx = cell % params.gridX;
+  let cy = (cell / params.gridX) % params.gridY;
+  let cz = cell / (params.gridX * params.gridY);
+  let plane = params.gridX * params.gridY;
+  for (var oz: u32 = 0u; oz < 27u; oz = oz + 1u) {
+    let dz = i32(oz / 9u) - 1;
+    let rem = oz % 9u;
+    let dy = i32(rem / 3u) - 1;
+    let dx = i32(rem % 3u) - 1;
+    let zz = u32(i32(cz) + dz);
+    let yy = u32(i32(cy) + dy);
+    let xx = u32(i32(cx) + dx);
+    if (zz >= params.gridZ || yy >= params.gridY || xx >= params.gridX) { continue; }
+    let c = xx + yy * params.gridX + zz * plane;
+    let count = min(atomicLoad(&cellCount[c]), CELL_CAP);
+    let base = c * CELL_CAP;
+    for (var k: u32 = 0u; k < count; k = k + 1u) {
+      let j = cellParticles[base + k];
+      if (j == i) { continue; }
+      let wj = invMass[j];
+      let wsum = w + wj;
+      if (wsum <= 0.0) { continue; }
+      let rr = ri + radius[j];
+      let pj = loadPos(j);
+      let d = p - pj;
+      let d2 = dot(d, d);
+      if (d2 >= rr * rr || d2 < 1e-12) { continue; }
+      let dist = sqrt(d2);
+      // this thread moves ONLY its own particle by its inverse-mass share
+      let coef = (rr - dist) / dist * (w / wsum) * 0.5;
+      p = p + d * coef;
+    }
+  }
+  storePos(i, p);
 }
 `;

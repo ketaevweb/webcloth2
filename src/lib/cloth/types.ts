@@ -50,6 +50,13 @@ export interface EngineSettings {
   bendStiffness: number;
   timeScale: number;
   paused: boolean;
+  /** Particle-vs-particle self / cross collision (spatial hash, CPU + GPU) */
+  selfCollision: boolean;
+  /**
+   * Tearing: a structural constraint breaks when stretched beyond
+   * restLength * tearFactor. 0 disables tearing.
+   */
+  tearFactor: number;
 }
 
 export const DEFAULT_SETTINGS: EngineSettings = {
@@ -70,6 +77,8 @@ export const DEFAULT_SETTINGS: EngineSettings = {
   bendStiffness: 0.55,
   timeScale: 1,
   paused: false,
+  selfCollision: true,
+  tearFactor: 0,
 };
 
 export interface EngineStats {
@@ -79,9 +88,17 @@ export interface EngineStats {
   particles: number;
   constraints: number;
   triangles: number;
+  bones: number;
   backend: BackendKind;
   adapter: string;
 }
+
+/**
+ * Self-collision: per-cloth particle radius = SELF_RADIUS_SCALE * avg edge
+ * length. At rest, adjacent particles sit 1/0.45 ≈ 2.2 radii apart, so the
+ * rest state never self-repels; folds and cross-cloth contacts do.
+ */
+export const SELF_RADIUS_SCALE = 0.45;
 
 /** Packed collider data — 3 vec4 per collider */
 export const MAX_COLLIDERS = 16;

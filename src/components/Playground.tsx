@@ -39,6 +39,7 @@ interface Runtime {
 const SCENE_TABS = [
   { id: "flag", label: "Флаг" },
   { id: "character", label: "Персонаж" },
+  { id: "bones", label: "Кости" },
   { id: "stress", label: "Стресс" },
 ];
 
@@ -50,7 +51,7 @@ export default function Playground() {
   const [stressCount, setStressCount] = useState(12);
   const [settings, setSettings] = useState<EngineSettings>({ ...DEFAULT_SETTINGS });
   const [stats, setStats] = useState<EngineStats>({
-    fps: 0, frameMs: 0, simMs: 0, particles: 0, constraints: 0, triangles: 0,
+    fps: 0, frameMs: 0, simMs: 0, particles: 0, constraints: 0, triangles: 0, bones: 0,
     backend: "cpu", adapter: "",
   });
   const [backend, setBackend] = useState<BackendKind>("cpu");
@@ -158,6 +159,7 @@ export default function Playground() {
             particles: r.engine.stats.particles,
             constraints: r.engine.stats.constraints,
             triangles: r.engine.stats.triangles,
+            bones: r.engine.stats.bones,
             backend: r.engine.backend,
             adapter: r.engine.adapterName,
           });
@@ -189,6 +191,7 @@ export default function Playground() {
     // remove leftover environment-unrelated objects? scenes clean themselves
     r.engine.clearCloths();
     r.engine.clearColliders();
+    r.engine.clearBoneChains();
     const s = createScene(sceneId, stressCount);
     s.build(r.engine, r.scene);
     s.setWireframe(wireframe);
@@ -274,6 +277,9 @@ export default function Playground() {
         </div>
         <div className="text-neutral-400">симуляция {stats.simMs} мс</div>
         <div className="text-neutral-400">частицы {stats.particles.toLocaleString("ru-RU")} · связи {stats.constraints.toLocaleString("ru-RU")}</div>
+        {stats.bones > 0 && (
+          <div className="text-neutral-400">кости {stats.bones}</div>
+        )}
         <div className="mt-1 flex items-center gap-1.5">
           <Badge variant={stats.backend === "webgpu" ? "default" : "secondary"} className="h-5 px-1.5 text-[10px]">
             {stats.backend === "webgpu" ? "WebGPU Compute" : "CPU · WebGL2"}
@@ -348,6 +354,34 @@ export default function Playground() {
             >
               {backend === "webgpu" ? "WebGPU" : "CPU"}
             </Button>
+          </div>
+
+          <div className="mb-3 grid grid-cols-2 gap-1.5">
+            <button
+              onClick={() => patch({ selfCollision: !settings.selfCollision })}
+              className={`rounded-lg px-2 py-1.5 text-[11px] font-medium transition-colors ${
+                settings.selfCollision
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-white/5 text-neutral-300 hover:bg-white/10"
+              }`}
+              aria-pressed={settings.selfCollision}
+            >
+              Самоколлизия
+            </button>
+            <div className="rounded-lg bg-white/5 px-2 py-1">
+              <div className="flex justify-between text-[10px] text-neutral-400">
+                <span>Прочность</span>
+                <span className="font-mono text-neutral-200">
+                  {settings.tearFactor > 0 ? `×${settings.tearFactor.toFixed(1)}` : "выкл"}
+                </span>
+              </div>
+              <Slider
+                value={[settings.tearFactor]}
+                min={0} max={4} step={0.1}
+                onValueChange={([v]) => patch({ tearFactor: v })}
+                aria-label="Прочность на разрыв"
+              />
+            </div>
           </div>
 
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-neutral-400">Физика</h3>

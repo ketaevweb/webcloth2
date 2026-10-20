@@ -2,15 +2,22 @@
 /**
  * WebCloth 2 — WebGPU compute backend.
  * Owns GPU buffers + compute pipelines, packs collider/param uniforms,
- * dispatches the XPBD pipeline and reads positions back for rendering.
+ * dispatches the XPBD pipeline (integrate -> solve -> selfCollide -> collide
+ * -> updateVelocity) and reads positions + tear flags back for rendering.
  */
 import { WGSL } from "./shaders";
 import { ADJ_STRIDE } from "./ClothBuilder";
-import type { ColliderLike, EngineSettings } from "./types";
+import { SELF_RADIUS_SCALE, type ColliderLike, type EngineSettings } from "./types";
 import type { SolverState } from "./CpuSolver";
 
-const UNIFORM_SIZE = 864; // 96 bytes header + 48 vec4 colliders
+// 96-byte scalars block + tear/grid block + 48 vec4 colliders.
+// Layout (bytes): n0 nc4 dt8 invDt12 | gravity16 windDir32 windParam48
+// dragParam64 tearParam80 | colliderCount96 gridX100 gridY104 gridZ108 |
+// gridOrigin112 gridParam128 | colliders144..912
+const UNIFORM_SIZE = 912;
 const STAGING_COUNT = 2;
+const CELL_CAP = 16;
+const MAX_CELLS = 65536; // keeps cellParticles <= 4 MB
 
 export class WebGpuSolver {
   device!: GPUDevice;
@@ -24,19 +31,30 @@ export class WebGpuSolver {
   private consOtherBuf!: GPUBuffer;
   private consConBuf!: GPUBuffer;
   private triAdjBuf!: GPUBuffer;
+  private radiusBuf!: GPUBuffer;
+  private brokenBuf!: GPUBuffer;
+  private cellCountBuf!: GPUBuffer;
+  private cellParticlesBuf!: GPUBuffer;
   private uniformBuf!: GPUBuffer;
   private staging: GPUBuffer[] = [];
   private stagingMapped = [false, false];
+  private brokenStaging!: GPUBuffer;
   private frameIndex = 0;
 
   private pipeIntegrate!: GPUComputePipeline;
   private pipeSolve!: GPUComputePipeline;
   private pipeCollide!: GPUComputePipeline;
   private pipeUpdateVel!: GPUComputePipeline;
+  private pipeClear!: GPUComputePipeline;
+  private pipeScatter!: GPUComputePipeline;
+  private pipeSelfCollide!: GPUComputePipeline;
   private bgIntegrate!: GPUBindGroup;
   private bgSolve!: GPUBindGroup;
   private bgCollide!: GPUBindGroup;
   private bgUpdateVel!: GPUBindGroup;
+  private bgClear!: GPUBindGroup;
+  private bgScatter!: GPUBindGroup;
+  private bgSelfCollide!: GPUBindGroup;
 
   private uniformData = new ArrayBuffer(UNIFORM_SIZE);
   private uniformU32 = new Uint32Array(this.uniformData);
@@ -49,6 +67,12 @@ export class WebGpuSolver {
   generation = 0;
   private onFail: () => void;
   private simTimeF32 = new Float32Array(1);
+  private oneU32 = new Uint32Array(1);
+
+  // uniform-grid geometry (computed in uploadState)
+  private gridDim = [1, 1, 1];
+  private gridOrigin = [0, 0, 0];
+  private cellSize = 0.1;
 
   private constructor(onFail: () => void) {
     this.onFail = onFail;
@@ -98,10 +122,16 @@ export class WebGpuSolver {
     const posBytes = Math.max(4, s.n * 3 * 4);
     const conBytes = Math.max(4, s.nc * 4 * 4);
     const adjBytes = Math.max(4, s.n * ADJ_STRIDE * 4);
+    const radBytes = Math.max(4, s.n * 4);
+    const brokenBytes = Math.max(4, s.nc * 4);
 
     this.posBuf?.destroy(); this.prevBuf?.destroy(); this.velBuf?.destroy();
     this.invMassBuf?.destroy(); this.constraintBuf?.destroy(); this.triAdjBuf?.destroy();
     this.consOffsetBuf?.destroy(); this.consOtherBuf?.destroy(); this.consConBuf?.destroy();
+    this.radiusBuf?.destroy(); this.brokenBuf?.destroy();
+    this.cellCountBuf?.destroy(); this.cellParticlesBuf?.destroy();
+    try { this.brokenStaging?.unmap(); } catch { /* not mapped */ }
+    this.brokenStaging?.destroy();
     for (const st of this.staging) { try { st.unmap(); } catch { /* not mapped */ } st.destroy(); }
     this.staging = [];
 
@@ -111,6 +141,9 @@ export class WebGpuSolver {
     this.invMassBuf = d.createBuffer({ size: Math.max(4, s.n * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.constraintBuf = d.createBuffer({ size: Math.max(4, conBytes), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.triAdjBuf = d.createBuffer({ size: Math.max(4, adjBytes), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.radiusBuf = d.createBuffer({ size: radBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.brokenBuf = d.createBuffer({ size: brokenBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    this.brokenStaging = d.createBuffer({ size: brokenBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.consOffsetBuf = d.createBuffer({ size: Math.max(4, s.consOffset.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.consOtherBuf = d.createBuffer({ size: Math.max(4, s.consOther.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.consConBuf = d.createBuffer({ size: Math.max(4, s.consCon.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
@@ -118,13 +151,51 @@ export class WebGpuSolver {
       this.staging.push(d.createBuffer({ size: posBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }));
     }
 
-    // pack constraints: [ia, ib, restBits, complianceBits] * nc
+    // self-collision uniform grid: bounds from the rest state, cell size grown
+    // until the grid fits MAX_CELLS (a larger cell is always safe — the 27-cell
+    // neighbourhood then covers MORE than the interaction radius).
+    let maxR = 0;
+    for (let i = 0; i < s.n; i++) if (s.radius[i] > maxR) maxR = s.radius[i];
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < s.n; i++) {
+      const i3 = i * 3;
+      const x = s.positions[i3], y = s.positions[i3 + 1], z = s.positions[i3 + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    if (!isFinite(minX)) { minX = minY = minZ = 0; maxX = maxY = maxZ = 1; }
+    const margin = Math.max(maxR * 2, 0.5) + 0.1;
+    const spanX = maxX - minX + margin * 2;
+    const spanY = maxY - minY + margin * 2;
+    const spanZ = maxZ - minZ + margin * 2;
+    let cell = Math.max(maxR * 2, 0.02);
+    const grow = () => {
+      const dx = Math.max(1, Math.ceil(spanX / cell));
+      const dy = Math.max(1, Math.ceil(spanY / cell));
+      const dz = Math.max(1, Math.ceil(spanZ / cell));
+      return [dx, dy, dz] as [number, number, number];
+    };
+    let dims = grow();
+    while (dims[0] * dims[1] * dims[2] > MAX_CELLS) {
+      cell *= 1.3;
+      dims = grow();
+    }
+    this.gridDim = dims;
+    this.gridOrigin = [minX - margin, minY - margin, minZ - margin];
+    this.cellSize = cell;
+    const cells = dims[0] * dims[1] * dims[2];
+    this.cellCountBuf = d.createBuffer({ size: Math.max(4, cells * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.cellParticlesBuf = d.createBuffer({ size: Math.max(4, cells * CELL_CAP * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+    // pack constraints: [ia|tearableBit, ib, restBits, complianceBits] * nc
     const conData = new Uint32Array(s.nc * 4);
     const scratch = new ArrayBuffer(4);
     const sf = new Float32Array(scratch);
     const su = new Uint32Array(scratch);
     for (let c = 0; c < s.nc; c++) {
-      conData[c * 4] = s.constraintA[c];
+      conData[c * 4] = s.constraintA[c] | (s.breakable[c] ? 0x80000000 : 0);
       conData[c * 4 + 1] = s.constraintB[c];
       sf[0] = s.restLength[c]; conData[c * 4 + 2] = su[0];
       sf[0] = s.compliance[c]; conData[c * 4 + 3] = su[0];
@@ -140,6 +211,8 @@ export class WebGpuSolver {
     q.writeBuffer(this.invMassBuf, 0, s.invMass as unknown as GPUAllowSharedBufferSource);
     if (s.nc > 0) q.writeBuffer(this.constraintBuf, 0, conData);
     if (s.n > 0) q.writeBuffer(this.triAdjBuf, 0, s.triAdj as unknown as GPUAllowSharedBufferSource);
+    q.writeBuffer(this.radiusBuf, 0, s.radius as unknown as GPUAllowSharedBufferSource);
+    q.writeBuffer(this.brokenBuf, 0, s.broken as unknown as GPUAllowSharedBufferSource);
     q.writeBuffer(this.consOffsetBuf, 0, s.consOffset as unknown as GPUAllowSharedBufferSource);
     if (s.consOther.byteLength > 0) {
       q.writeBuffer(this.consOtherBuf, 0, s.consOther as unknown as GPUAllowSharedBufferSource);
@@ -158,6 +231,9 @@ export class WebGpuSolver {
     this.pipeSolve = mk("solve");
     this.pipeCollide = mk("collide");
     this.pipeUpdateVel = mk("updateVelocity");
+    this.pipeClear = mk("clearCells");
+    this.pipeScatter = mk("scatterCells");
+    this.pipeSelfCollide = mk("selfCollide");
 
     const group = (pipe: GPUComputePipeline, bindings: Array<[number, GPUBuffer]>) =>
       d.createBindGroup({
@@ -171,13 +247,24 @@ export class WebGpuSolver {
     ]);
     this.bgSolve = group(this.pipeSolve, [
       [0, this.posBuf], [3, this.invMassBuf], [4, this.constraintBuf], [6, this.uniformBuf!],
-      [7, this.consOffsetBuf], [8, this.consOtherBuf], [9, this.consConBuf],
+      [7, this.consOffsetBuf], [8, this.consOtherBuf], [9, this.consConBuf], [10, this.brokenBuf],
     ]);
     this.bgCollide = group(this.pipeCollide, [
       [0, this.posBuf], [2, this.velBuf], [3, this.invMassBuf], [6, this.uniformBuf!],
     ]);
     this.bgUpdateVel = group(this.pipeUpdateVel, [
       [0, this.posBuf], [1, this.prevBuf], [2, this.velBuf], [3, this.invMassBuf], [6, this.uniformBuf!],
+    ]);
+    this.bgClear = group(this.pipeClear, [
+      [6, this.uniformBuf!], [12, this.cellCountBuf],
+    ]);
+    this.bgScatter = group(this.pipeScatter, [
+      [0, this.posBuf], [3, this.invMassBuf], [6, this.uniformBuf!],
+      [11, this.radiusBuf], [12, this.cellCountBuf], [13, this.cellParticlesBuf],
+    ]);
+    this.bgSelfCollide = group(this.pipeSelfCollide, [
+      [0, this.posBuf], [3, this.invMassBuf], [6, this.uniformBuf!],
+      [11, this.radiusBuf], [12, this.cellCountBuf], [13, this.cellParticlesBuf],
     ]);
   }
 
@@ -202,6 +289,21 @@ export class WebGpuSolver {
     }
   }
 
+  /** Push CPU-side broken flags (bend cascade) into the GPU array. */
+  writeBroken(indices: number[]) {
+    const q = this.device.queue;
+    for (let k = 0; k < indices.length; k++) {
+      this.oneU32[0] = 1;
+      q.writeBuffer(this.brokenBuf, indices[k] * 4, this.oneU32);
+    }
+  }
+
+  /** Clear all broken flags (engine.reset). */
+  resetBroken() {
+    const zeros = new Uint32Array(this.nc);
+    this.device.queue.writeBuffer(this.brokenBuf, 0, zeros);
+  }
+
   /** Dispatch one full simulation step (all substeps). */
   step(dt: number, settings: EngineSettings, colliders: ColliderLike[], hasKinematics: boolean) {
     this.ensureUniform();
@@ -223,12 +325,15 @@ export class WebGpuSolver {
     f32[12] = settings.windFrequency; f32[13] = settings.windTurbulence * settings.windStrength;
     f32[14] = settings.windGust; f32[15] = this.simTime;
     f32[16] = settings.aeroDrag; f32[17] = settings.damping; f32[18] = settings.maxVelocity; f32[19] = settings.friction;
-    u32[20] = Math.min(colliders.length, 16);
-    u32[21] = 0; u32[22] = 0; u32[23] = 0;
+    f32[20] = settings.tearFactor; f32[21] = SELF_RADIUS_SCALE; f32[22] = 0; f32[23] = 0;
+    u32[24] = Math.min(colliders.length, 16);
+    u32[25] = this.gridDim[0]; u32[26] = this.gridDim[1]; u32[27] = this.gridDim[2];
+    f32[28] = this.gridOrigin[0]; f32[29] = this.gridOrigin[1]; f32[30] = this.gridOrigin[2]; f32[31] = 0;
+    f32[32] = this.cellSize; f32[33] = 0; f32[34] = 0; f32[35] = 0;
     const maxC = Math.min(colliders.length, 16);
     for (let c = 0; c < maxC; c++) {
       const col = colliders[c];
-      const o = 24 + c * 12;
+      const o = 36 + c * 12;
       f32[o] = col.ax; f32[o + 1] = col.ay; f32[o + 2] = col.az; f32[o + 3] = col.radius;
       f32[o + 4] = col.bx; f32[o + 5] = col.by; f32[o + 6] = col.bz;
       f32[o + 7] = col.kind === "sphere" ? 0 : col.kind === "capsule" ? 1 : 2;
@@ -237,6 +342,9 @@ export class WebGpuSolver {
     d.queue.writeBuffer(this.uniformBuf, 0, this.uniformData);
 
     const nWg = Math.ceil(this.n / 64) || 1;
+    const cells = this.gridDim[0] * this.gridDim[1] * this.gridDim[2];
+    const cellsWg = Math.ceil(cells / 64) || 1;
+    const selfOn = settings.selfCollision && this.n > 0;
     const encoder = d.createCommandEncoder();
     const pass = encoder.beginComputePass();
     for (let s = 0; s < substeps; s++) {
@@ -250,6 +358,17 @@ export class WebGpuSolver {
       pass.setPipeline(this.pipeSolve);
       pass.setBindGroup(0, this.bgSolve);
       for (let k = 0; k < iters; k++) pass.dispatchWorkgroups(nWg);
+      if (selfOn) {
+        pass.setPipeline(this.pipeClear);
+        pass.setBindGroup(0, this.bgClear);
+        pass.dispatchWorkgroups(cellsWg);
+        pass.setPipeline(this.pipeScatter);
+        pass.setBindGroup(0, this.bgScatter);
+        pass.dispatchWorkgroups(nWg);
+        pass.setPipeline(this.pipeSelfCollide);
+        pass.setBindGroup(0, this.bgSelfCollide);
+        pass.dispatchWorkgroups(nWg);
+      }
       pass.setPipeline(this.pipeCollide);
       pass.setBindGroup(0, this.bgCollide);
       pass.dispatchWorkgroups(nWg);
@@ -264,6 +383,9 @@ export class WebGpuSolver {
     // invalidates the whole command buffer (silently dropped on submit).
     const slot = this.frameIndex % STAGING_COUNT;
     encoder.copyBufferToBuffer(this.posBuf, 0, this.staging[slot], 0, this.n * 3 * 4);
+    if (this.nc > 0) {
+      encoder.copyBufferToBuffer(this.brokenBuf, 0, this.brokenStaging, 0, this.nc * 4);
+    }
     d.queue.submit([encoder.finish()]);
     this.frameIndex++;
     void hasKinematics;
@@ -319,6 +441,22 @@ export class WebGpuSolver {
     }
   }
 
+  /** Read GPU-side tear flags into `dst` (Uint32Array of length nc). */
+  async readbackBroken(dst: Uint32Array): Promise<boolean> {
+    if (this.nc === 0 || !this.brokenStaging) return false;
+    try {
+      await this.brokenStaging.mapAsync(GPUMapMode.READ);
+      const src = new Uint32Array(this.brokenStaging.getMappedRange());
+      dst.set(src.subarray(0, Math.min(src.length, dst.length)));
+      this.brokenStaging.unmap();
+      return true;
+    } catch (e) {
+      console.warn("[WebCloth] broken staging map failed:", String(e).slice(0, 120));
+      try { this.brokenStaging.unmap(); } catch { /* ignore */ }
+      return false;
+    }
+  }
+
   resetTime() {
     this.simTime = 0;
   }
@@ -326,7 +464,11 @@ export class WebGpuSolver {
   destroy() {
     this.posBuf?.destroy(); this.prevBuf?.destroy(); this.velBuf?.destroy();
     this.invMassBuf?.destroy(); this.constraintBuf?.destroy(); this.triAdjBuf?.destroy();
+    this.radiusBuf?.destroy(); this.brokenBuf?.destroy();
+    this.cellCountBuf?.destroy(); this.cellParticlesBuf?.destroy();
     this.uniformBuf?.destroy();
+    try { this.brokenStaging?.unmap(); } catch { /* ignore */ }
+    this.brokenStaging?.destroy();
     for (const st of this.staging) { try { st.unmap(); } catch { /* ignore */ } st.destroy(); }
     this.staging = [];
     try { this.device.destroy(); } catch { /* ignore */ }
